@@ -200,6 +200,11 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 		secretKey = ""
 	}
 
+	var sessionToken string
+	if val, ok := parameters["sessiontoken"].(string); ok {
+		sessionToken = val
+	}
+
 	regionEndpoint := parameters["regionendpoint"]
 	if regionEndpoint == nil {
 		regionEndpoint = ""
@@ -403,8 +408,6 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 	default:
 		return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
 	}
-
-	sessionToken := ""
 
 	accelerateBool := false
 	accelerate := parameters["accelerate"]

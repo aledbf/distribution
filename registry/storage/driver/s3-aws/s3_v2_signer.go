@@ -136,6 +136,8 @@ func (v2 *signer) Sign() error {
 	v2.Request.Header["date"] = []string{v2.Time.In(time.UTC).Format(time.RFC1123)}
 	if credValue.SessionToken != "" {
 		v2.Request.Header["x-amz-security-token"] = []string{credValue.SessionToken}
+	} else {
+		log.Warn("#### SessionToken is empty")
 	}
 
 	smap = make(map[string]string)
