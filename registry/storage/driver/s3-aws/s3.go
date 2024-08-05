@@ -200,6 +200,11 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		}
 	}
 
+	var sessionToken string
+	if val, ok := parameters["sessiontoken"].(string); ok {
+		sessionToken = val
+	}
+
 	bucket := parameters["bucket"]
 	if bucket == nil || fmt.Sprint(bucket) == "" {
 		return nil, fmt.Errorf("no bucket parameter provided")
@@ -340,8 +345,6 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		}
 		objectACL = objectACLString
 	}
-
-	sessionToken := ""
 
 	params := DriverParameters{
 		fmt.Sprint(accessKey),
