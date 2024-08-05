@@ -689,82 +689,53 @@ func (d *driver) Writer(ctx context.Context, path string, appendMode bool) (stor
 		Bucket: aws.String(d.Bucket),
 		Prefix: aws.String(key),
 	}
+
+	var multipartUpload *s3.MultipartUpload
+	var uploadID string
+
 	for {
 		resp, err := d.S3.ListMultipartUploadsWithContext(ctx, listMultipartUploadsInput)
 		if err != nil {
+			// If we get a 403 Forbidden error, it might be due to lack of ListMultipartUploads permission
+			// In this case, we'll try to create a new multipart upload instead
+			if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "AccessDenied" {
+				return d.createNewMultipartUpload(ctx, key)
+			}
 			return nil, parseError(path, err)
 		}
 
-		// resp.Uploads can only be empty on the first call
-		// if there were no more results to return after the first call, resp.IsTruncated would have been false
-		// and the loop would be exited without recalling ListMultipartUploads
-		if len(resp.Uploads) == 0 {
-			fi, err := d.Stat(ctx, path)
-			if err != nil {
-				return nil, parseError(path, err)
-			}
-
-			if fi.Size() == 0 {
-				resp, err := d.S3.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
-					Bucket:               aws.String(d.Bucket),
-					Key:                  aws.String(key),
-					ContentType:          d.getContentType(),
-					ACL:                  d.getACL(),
-					ServerSideEncryption: d.getEncryptionMode(),
-					SSEKMSKeyId:          d.getSSEKMSKeyID(),
-					StorageClass:         d.getStorageClass(),
-				})
-				if err != nil {
-					return nil, err
-				}
-				return d.newWriter(ctx, key, *resp.UploadId, nil), nil
-			}
-			return nil, storagedriver.Error{
-				DriverName: driverName,
-				Detail:     fmt.Errorf("append to zero-size path %s unsupported", path),
+		// Find the multipart upload for this specific key
+		for _, upload := range resp.Uploads {
+			if *upload.Key == key {
+				multipartUpload = upload
+				uploadID = *upload.UploadId
+				break
 			}
 		}
 
-		var allParts []*s3.Part
-		for _, multi := range resp.Uploads {
-			if key != *multi.Key {
-				continue
-			}
-
-			partsList, err := d.S3.ListPartsWithContext(ctx, &s3.ListPartsInput{
-				Bucket:   aws.String(d.Bucket),
-				Key:      aws.String(key),
-				UploadId: multi.UploadId,
-			})
-			if err != nil {
-				return nil, parseError(path, err)
-			}
-			allParts = append(allParts, partsList.Parts...)
-			for *partsList.IsTruncated {
-				partsList, err = d.S3.ListPartsWithContext(ctx, &s3.ListPartsInput{
-					Bucket:           aws.String(d.Bucket),
-					Key:              aws.String(key),
-					UploadId:         multi.UploadId,
-					PartNumberMarker: partsList.NextPartNumberMarker,
-				})
-				if err != nil {
-					return nil, parseError(path, err)
-				}
-				allParts = append(allParts, partsList.Parts...)
-			}
-			return d.newWriter(ctx, key, *multi.UploadId, allParts), nil
-		}
-
-		// resp.NextUploadIdMarker must have at least one element or we would have returned not found
-		listMultipartUploadsInput.UploadIdMarker = resp.NextUploadIdMarker
-
-		// from the s3 api docs, IsTruncated "specifies whether (true) or not (false) all of the results were returned"
-		// if everything has been returned, break
-		if resp.IsTruncated == nil || !*resp.IsTruncated {
+		if multipartUpload != nil {
 			break
 		}
+
+		if !*resp.IsTruncated {
+			break
+		}
+
+		listMultipartUploadsInput.KeyMarker = resp.NextKeyMarker
+		listMultipartUploadsInput.UploadIdMarker = resp.NextUploadIdMarker
 	}
-	return nil, storagedriver.PathNotFoundError{Path: path}
+
+	if multipartUpload == nil {
+		return d.createNewMultipartUpload(ctx, key)
+	}
+
+	// Fetch the existing parts
+	parts, err := d.getExistingParts(ctx, key, uploadID)
+	if err != nil {
+		return nil, err
+	}
+
+	return d.newWriter(ctx, key, uploadID, parts), nil
 }
 
 func (d *driver) statHead(ctx context.Context, path string) (*storagedriver.FileInfoFields, error) {
@@ -1270,8 +1241,51 @@ func reverse(s []string) {
 	}
 }
 
+func (d *driver) createNewMultipartUpload(ctx context.Context, key string) (storagedriver.FileWriter, error) {
+	resp, err := d.S3.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:               aws.String(d.Bucket),
+		Key:                  aws.String(key),
+		ContentType:          d.getContentType(),
+		ACL:                  d.getACL(),
+		ServerSideEncryption: d.getEncryptionMode(),
+		SSEKMSKeyId:          d.getSSEKMSKeyID(),
+		StorageClass:         d.getStorageClass(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return d.newWriter(ctx, key, *resp.UploadId, nil), nil
+}
+
+func (d *driver) getExistingParts(ctx context.Context, key, uploadID string) ([]*s3.Part, error) {
+	listPartsInput := &s3.ListPartsInput{
+		Bucket:   aws.String(d.Bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	}
+
+	var parts []*s3.Part
+
+	for {
+		listPartsOutput, err := d.S3.ListPartsWithContext(ctx, listPartsInput)
+		if err != nil {
+			return nil, err
+		}
+
+		parts = append(parts, listPartsOutput.Parts...)
+
+		if !*listPartsOutput.IsTruncated {
+			break
+		}
+
+		listPartsInput.PartNumberMarker = listPartsOutput.NextPartNumberMarker
+	}
+
+	return parts, nil
+}
+
 func (d *driver) s3Path(path string) string {
-	return strings.TrimLeft(strings.TrimRight(d.RootDirectory, "/")+path, "/")
+	return strings.TrimLeft(filepath.Join(d.RootDirectory, path), "/")
 }
 
 // S3BucketKey returns the s3 bucket key for the given storage driver path.
